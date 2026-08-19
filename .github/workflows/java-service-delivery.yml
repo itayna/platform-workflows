@@ -122,14 +122,14 @@ jobs:
           format: spdx-json
           output-file: sbom.spdx.json
 
-      - name: Attach SBOM to image
-        uses: anchore/sbom-action/publish-sbom@v0.17.7
-        with:
-          image: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
-          sbom-artifact-match: sbom.spdx.json
-
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
+
+      - name: Attach SBOM to image
+        # anchore/sbom-action/publish-sbom only attaches to GitHub Releases, not OCI images —
+        # it reported success while doing nothing to the registry. cosign attach is the
+        # actual mechanism; it's what `cosign download sbom` (used by bin/scorecard) reads.
+        run: cosign attach sbom --sbom sbom.spdx.json ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
 
       - name: Sign image (keyless)
         run: cosign sign --yes ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
