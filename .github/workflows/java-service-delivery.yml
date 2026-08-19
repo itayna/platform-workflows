@@ -46,15 +46,18 @@ permissions:
   packages: write
   id-token: write
 
-# Newest commit wins. Without this, a slow older run can finish last and write a
-# stale tag into the dev environment.
-concurrency:
-  group: delivery-${{ inputs.service-name }}
-  cancel-in-progress: true
-
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    # concurrency lives here, not at workflow level: the `inputs` context
+    # (service-name) is not available in a reusable workflow's top-level
+    # concurrency block, only inside a job — using it there is an invalid
+    # workflow file, which GitHub reports as a silent startup_failure with
+    # no job ever created. Jobs below are a linear `needs` chain, so
+    # cancelling this one cancels the whole run for that service.
+    concurrency:
+      group: delivery-${{ inputs.service-name }}
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v5
