@@ -125,6 +125,7 @@ jobs:
       - name: Attach SBOM to image
         uses: anchore/sbom-action/publish-sbom@v0.17.7
         with:
+          image: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
           sbom-artifact-match: sbom.spdx.json
 
       - name: Install cosign
