@@ -1,0 +1,166 @@
+name: java-service-delivery
+
+# The platform's delivery pipeline. Every Java service on the paved road calls
+# this instead of copying it, so a new mandatory step is one commit here plus a
+# tag move — not an edit in N service repositories.
+#
+# Callers reference it as:
+#   uses: itayna/platform-workflows/.github/workflows/java-service-delivery.yml@v1
+#
+# Note on signing identity: with a reusable workflow, the Fulcio certificate
+# identity is *this* file's ref, not the caller's. That is what lets the Kyverno
+# policy trust one identity for every service instead of gaining a rule per
+# service. What the signature proves therefore changes from "built by this
+# service's own workflow" to "built by version v1.x of the platform pipeline";
+# the service repository is still recorded in the certificate extensions and in
+# the SBOM. See ADR-0008 in the platform repository.
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Service name. Also the image name and the manifest directory."
+        required: true
+        type: string
+      java-version:
+        description: "Temurin JDK version"
+        required: false
+        type: string
+        default: "25"
+      platform-repo:
+        description: "GitOps repository this pipeline writes the dev tag into"
+        required: false
+        type: string
+        default: itayna/terasky-platform-ha
+      registry:
+        required: false
+        type: string
+        default: ghcr.io
+    secrets:
+      PLATFORM_REPO_DEPLOY_KEY:
+        description: "SSH deploy key with write access to the platform repository"
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+# Newest commit wins. Without this, a slow older run can finish last and write a
+# stale tag into the dev environment.
+concurrency:
+  group: delivery-${{ inputs.service-name }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+          cache: maven
+      - run: mvn -B verify
+
+  scan-source:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy filesystem scan (fail on critical)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          severity: CRITICAL
+          exit-code: "1"
+
+  build-push-sign:
+    needs: scan-source
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: ${{ inputs.registry }}/${{ github.repository_owner }}/${{ inputs.service-name }}
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+
+      - name: Trivy image scan (fail on critical)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          exit-code: "1"
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@v0.17.7
+        with:
+          image: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Attach SBOM to image
+        uses: anchore/sbom-action/publish-sbom@v0.17.7
+        with:
+          sbom-artifact-match: sbom.spdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless)
+        run: cosign sign --yes ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+
+  promote-dev:
+    needs: build-push-sign
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.platform-repo }}
+          ssh-key: ${{ secrets.PLATFORM_REPO_DEPLOY_KEY }}
+
+      - name: Update dev image tag
+        env:
+          TAG: ${{ needs.build-push-sign.outputs.tag }}
+          KUSTOMIZATION: environments/dev/${{ inputs.service-name }}/kustomization.yaml
+        run: |
+          test -f "$KUSTOMIZATION" || {
+            echo "::error::$KUSTOMIZATION not found in ${{ inputs.platform-repo }}."
+            echo "::error::Was this service onboarded with 'make onboard'?"
+            exit 1
+          }
+          git config user.name "delivery-bot"
+          git config user.email "delivery-bot@users.noreply.github.com"
+          # Retry: several services pushing dev tags at once collide on main.
+          for attempt in 1 2 3 4 5; do
+            git checkout -- . && git pull --rebase --quiet
+            sed -i "s|newTag: .*|newTag: ${TAG}|" "$KUSTOMIZATION"
+            git diff --quiet && { echo "dev already on ${TAG}"; exit 0; }
+            git commit -aqm "deploy ${{ inputs.service-name }}:${TAG} to dev"
+            git push --quiet && exit 0
+            echo "push rejected, retrying (${attempt}/5)"
+            git reset --hard --quiet origin/HEAD
+            sleep $(( attempt * 3 ))
+          done
+          echo "::error::could not push the dev tag after 5 attempts"
+          exit 1
