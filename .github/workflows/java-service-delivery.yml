@@ -59,6 +59,22 @@ jobs:
       group: delivery-${{ inputs.service-name }}
       cancel-in-progress: true
     steps:
+      # One service per repository is the platform's shape, so service-name and
+      # the calling repository's name must agree. When they don't, this repository's
+      # source is built and signed under another service's image name, and
+      # promote-dev retags that other service in dev — which is how a copied
+      # delivery.yml becomes a supply-chain problem rather than a typo. Cheap to
+      # check, so check it before anything is built.
+      - name: Service name must match the calling repository
+        env:
+          SERVICE: ${{ inputs.service-name }}
+          CALLER: ${{ github.repository }}
+        run: |
+          test "$SERVICE" = "${CALLER##*/}" || {
+            echo "::error::service-name '$SERVICE' does not match repository '$CALLER'."
+            echo "::error::Fix service-name in .github/workflows/delivery.yml."
+            exit 1
+          }
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v5
         with:
